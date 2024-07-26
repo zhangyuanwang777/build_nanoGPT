@@ -1,0 +1,11 @@
+# 忽略目录
+checkpoints/
+logs/
+model/
+edu_fineweb10B/
+public_program/
+variables/
+
+# 忽略 Python 编译文件
+*.pyc
+__pycache__/
