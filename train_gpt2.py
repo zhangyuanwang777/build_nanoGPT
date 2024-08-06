@@ -7,7 +7,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from utils import Logger, VariableTracker
-from hellaswag import render_example, iterate_examples
+from hellaswag import HellaSwagEvaluator
+from lambada_openai import LambadaEvaluator
+from storycloze import StoryClozeEvaluator
 
 class CausalSelfAttention(nn.Module):
 
@@ -71,7 +73,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024 # max sequence length
+    block_size: int = 2048 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
@@ -246,29 +248,6 @@ class DataLoaderLite:
             self.current_position = B * T * self.process_rank
         return x, y
 
-# -----------------------------------------------------------------------------
-# helper function for HellaSwag eval
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
-
-def get_most_likely_row(tokens, mask, logits):
-    # evaluate the autoregressive loss at all positions
-    shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_shift_tokens = shift_tokens.view(-1)
-    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-    shift_losses = shift_losses.view(tokens.size(0), -1)
-    # now get the average loss just for the completion region (where mask == 1), in each row
-    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-    masked_shift_losses = shift_losses * shift_mask
-    # sum and divide by the number of 1s in the mask
-    sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
-    # now we have a loss for each of the 4 completions
-    # the one with the lowest loss should be the most likely
-    pred_norm = avg_loss.argmin().item()
-    return pred_norm
-
 #--------------------------------------------------------------------------------
 # run the training loop
 # simple launch:
@@ -278,6 +257,7 @@ def get_most_likely_row(tokens, mask, logits):
 
 import time
 import math
+from datetime import datetime
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
@@ -287,7 +267,7 @@ import torch.distributed as dist
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  #（保证程序cuda序号与实际cuda序号对应）
-    # os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7" # 使用第几个cuda
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3" # 使用第几个cuda
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
     init_process_group(backend='nccl') # 初始化进程组，使用nccl作为后端。
@@ -309,8 +289,26 @@ else:
     os.environ["CUDA_VISIBLE_DEVICES"] = "4" # 使用第几个cuda
     device = "cuda"
 
-logger = Logger(use_logging=master_process) # 只有主进程进行日志记录
-vt = VariableTracker(keys=['step', 'train_loss','val_loss','hellaswg_acc','lr'], master_process=master_process) # 只有主进程进行数据添加
+# RECORD_CACHE_DIR 是记录训练过程的文件夹，其中包含每次训练的日志 权重文件 变量
+# RECORD_DIR 是当前训练循环的记录文件夹
+RECORD_CACHE_DIR = os.path.join(os.path.dirname(__file__), "gpt2_training_record")
+RECORD_DIR = os.path.join(RECORD_CACHE_DIR, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+if master_process:
+    os.makedirs(RECORD_CACHE_DIR, exist_ok=True)
+    os.makedirs(os.path.join(RECORD_DIR, "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(RECORD_DIR, "variables"), exist_ok=True)
+
+HELLASWAG_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
+HELLASWAG_PATH = os.path.join(HELLASWAG_CACHE_DIR, f"hellaswag_val.jsonl")
+
+STORYCLOZE_CACHE_DIR = os.path.join(os.path.dirname(__file__), "StoryCloze")
+STORYCLOZE_PATH = os.path.join(STORYCLOZE_CACHE_DIR, "cloze_test_val__winter2018-cloze_test_ALL_val - 1 - 1.csv")
+
+LAMBADA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "lambada_openai")
+LAMBADA_PATH = os.path.join(LAMBADA_CACHE_DIR, "lambada_test_en.jsonl")
+
+logger = Logger(log_directory=RECORD_DIR, use_logging=master_process) # 只有主进程进行日志记录
+vt = VariableTracker(keys=['step', 'train_loss','val_loss','hellaswg_acc', 'storycloze_acc', 'lambada_openai','lr'], master_process=master_process) # 只有主进程进行数据添加
 
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 # device是设备，device_type是设备类型，device_type被用于autocast中
@@ -322,8 +320,8 @@ torch.cuda.manual_seed(1337)
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 8 # micro batch size
-T = 1024 # sequence length
+B = 2 # micro batch size
+T = 2048 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 logger.mes(f"total batch size: {total_batch_size}")
@@ -348,7 +346,7 @@ max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
 # 10B tokens，每一个 step 是 0.5M tokens，19073个 step 刚好可以遍历完 10B tokens
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 19073 * 4 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) 预热期，当iter数小于warmup_steps时，lr线性增加
     if it < warmup_steps:
@@ -392,7 +390,7 @@ for step in range(max_steps):
             vt.append("val_loss", val_loss_accum.item())
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
-                checkpoint_path = os.path.join("./checkpoints", f"model_{step:05d}.pt")
+                checkpoint_path = os.path.join(RECORD_DIR, "checkpoints", f"model_{step:05d}.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
@@ -402,27 +400,28 @@ for step in range(max_steps):
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
-                vt.save(os.path.join("./variables", f"variables_{step:05d}.npy"))
+                vt.save(os.path.join(RECORD_DIR, "variables", f"variables_{step:05d}.npy"))
     else:
         vt.append("val_loss", None)
 
-    # once in a while evaluate hellaswag
+    # evaluate hellaswag-------------------------------------
     if (step % 250 == 0 or last_step) and (not use_compile):
+        hellaswag_evaluator = HellaSwagEvaluator()
         num_correct_norm = 0
         num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
+        for i, example in enumerate(hellaswag_evaluator.iterate_examples(HELLASWAG_PATH)):
             # only process examples where i % ddp_world_size == ddp_rank
             if i % ddp_world_size != ddp_rank:
                 continue
             # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
+            _, tokens, mask, label = hellaswag_evaluator.render_example(example, enc)
             tokens = tokens.to(device)
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
+                    logits, _ = model(tokens)
+                _, pred_norm = hellaswag_evaluator.evaluate_in_training(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
         # reduce the stats across all processes
@@ -439,6 +438,65 @@ for step in range(max_steps):
     else:
         vt.append("hellaswg_acc", None)
     
+    # evaluate storycloze-------------------------------------
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        storycloze_evaluator = StoryClozeEvaluator()
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(storycloze_evaluator.iterate_examples(STORYCLOZE_PATH)):
+            if i % ddp_world_size != ddp_rank:
+                continue
+            tokens, mask, label = storycloze_evaluator.render_example(example, enc)
+            tokens, mask = tokens.to(device), mask.to(device)
+            label = label - 1 # label只有1和2，使其从0开始
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, _ = model(tokens)
+                _, pred_norm = storycloze_evaluator.evaluate_in_training(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        logger.mes(f"StoryCloze accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+        vt.append("storycloze_acc", acc_norm)
+    else:
+        vt.append("storycloze_acc", None)
+
+    # evaluate lambada_openai-----------------------------------
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        lambada_evaluator = LambadaEvaluator()
+        num_correct = 0
+        num_total = 0
+        for i, example in enumerate(lambada_evaluator.iterate_examples(LAMBADA_PATH)):
+            if i % ddp_world_size != ddp_rank:
+                continue
+            tokens = lambada_evaluator.render_example(example, enc)
+            tokens = tokens.to(device)
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, _ = model(tokens)
+                predicted_tokens = lambada_evaluator.evaluate_in_training(logits)
+            num_total += 1
+            num_correct += int(predicted_tokens == tokens.view(-1)[-1])
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct = torch.tensor(num_correct, dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct, op=dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct = num_correct.item()
+        acc = num_correct / num_total
+        logger.mes(f"Lambada_openai accuracy: {num_correct}/{num_total}={acc:.4f}")
+        vt.append("lambada_openai", acc)
+    else:
+        vt.append("lambada_openai", None)
+
     # do one step of the optimization
     model.train()
     optimizer.zero_grad() # 梯度清零

@@ -86,7 +86,7 @@ class VariableTracker:
         for i in keys:
             self.variables[i] = []
         
-    def append(self, name: str, value):
+    def append(self, name: str, value) -> None:
         """更新现有变量的值"""
         assert name in self.keys, "变量不存在"
         if self.master_process:

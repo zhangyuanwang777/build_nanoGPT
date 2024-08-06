@@ -85,6 +85,10 @@ def _init_weights(self, module):
 
 ## nvidia显卡的浮点精度
 
+### 浮点数如何表示？
+
+![浮点数的表示](assets/浮点数的表示.png)
+
 ### 显卡浮点数精度是什么？
 
 在浮点数表示中，数值由三个部分组成：符号位、指数部分和尾数部分（通常称为精度部分）。每个部分在数值的表示和计算中扮演着不同的角色：
@@ -574,7 +578,9 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 
 使用`fineweb.py`下载数据并进行处理。
 
-。。。
+进行数据预处理时，使用了`multiprocessing`包多进程的方法来加速计算，使用了指针的方法来对数据进行分片处理。
+
+最终数据被切分成100份，每份占100M tokens（实际会有所不同，最后一份数据可能会小于100M tokens）。
 
 ### 加载数据集
 
@@ -582,22 +588,96 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 
 ## 验证集
 
-
-
+使用数据加载器加载验证机数据，每次加载`B*T*self.num_processes`个token，循环20次计算结果。每次使用验证集，加载的token数量为`B*T*self.num_processes*20`。
 
 ## 测试集
 
+在进行测试前，需要进行如下准备：
+
+- 下载数据
+- 预处理数据为合适的格式
+- 编写数据迭代器
+- 评估模型
+
+下面是评估模型的核心代码。得到处理好的数据之后，将数据输入模型中，得到 logits 输出，计算 logits 输出与标签（对应位置的 token ）的交叉熵损失。计算交叉熵损失实际就是计算每个位置的预测准确率，通过[公式](https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html)可以计算每个位置的损失值，如果传入一个minibatch的数据，那么计算出来的就是一系列的损失值。此处的minibatch就是指一个句子的 tokens 长度。由于我们不需要将所有损失汇总（求和或求均值），所以设置参数 `reduction='none'` ，这样最终得到的就是一个损失值组成的向量，得到该向量后，就可以根据不同的任务进行后续计算。
+
+```python
+logits = model(tokens).logits
+# contiguous 方法在 PyTorch 中用于确保张量在内存中的存储是连续的
+shift_logits = (logits[..., :-1, :]).contiguous() # 去掉最后一个时间步的 logits
+shift_tokens = (tokens[..., 1:]).contiguous() # 去掉第一个时间步的 tokens
+# 将 shift_logits 和 shift_tokens 展平，使得每个位置的 logits 和 tokens 对应
+flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+flat_shift_tokens = shift_tokens.view(-1)
+shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none') # 计算所有位置的交叉熵损失，不进行任何归约（reduction='none'），返回每个位置的损失值
+shift_losses = shift_losses.view(tokens.size(0), -1) # 损失值恢复为原来的形状
+```
+
+❓为什么要对logits和tokens进行偏移？
+
+一般情况下，自回归语言模型每一步的预测 logits 都是对于下一个时间步的预测，所以 logits[i, t, :] 表示在时间步 t 模型对第 i 个样本的所有可能下一个 token 的预测得分。因此需要对logits和tokens进行偏移，使得logits[i, t, :] 表示在时间步 t 模型对第 i 个样本的第 t 个 token 的预测得分，方便后续计算。
+
 ### [Hellaswag](https://huggingface.co/datasets/Rowan/hellaswag)
+
+GPT3 Zero-shot --> 33.7
 
 使用Hellaswag对模型进行测试。该数据集由[斯坦福大学于2019年提出](https://arxiv.org/pdf/1905.07830)，用于评估NLP模型在常识自然语言推理（NLI）任务上的性能。
 
 对于一个字符串，有4个备选答案，语言模型需要从中选择最佳答案。基本思路：使用训练完成的GPT2模型预测不同选项生成的概率，选择概率最大的选项为最终答案，这样就能计算测试集的准确率（GPT3-small在该数据集上的准确率为33.7%）。
 
+Datasets Description:
+```json
+{
+    "activity_label": "Removing ice from car",
+    "ctx": "Then, the man writes over the snow covering the window of a car, and a woman wearing winter clothes smiles. then",
+    "ctx_a": "Then, the man writes over the snow covering the window of a car, and a woman wearing winter clothes smiles.",
+    "ctx_b": "then",
+    "endings": "[\", the man adds wax to the windshield and cuts it.\", \", a person board a ski lift, while two men supporting the head of the per...",
+    "ind": 4,
+    "label": "3",
+    "source_id": "activitynet~v_-1IBHYS3L-Y",
+    "split": "train",
+    "split_type": "indomain"
+}
+```
+
 ![hellaswag测试](assets/hellaswag测试.png)
 
-### [EleutherAI](https://github.com/EleutherAI/lm-evaluation-harness)
+⚠️需要注意的是，Hellaswag有两种准确率，一种是普通的accuracy，一种是accuracy_norm。前者是对一句话的每一个token的损失求和，对结果取最小值，后者是在求和之后又除以了文本的长度，排除了文本长度的影响，因此使用accuracy_norm来评估更为合理。
 
+### [LAMBADA](https://huggingface.co/datasets/EleutherAI/lambada_openai)
 
+GPT3 Zero-shot --> 42.7
+
+LAMBADA is used to evaluate the capabilities of computational models for text understanding by means of a word prediction task. LAMBADA is a collection of narrative texts sharing the characteristic that human subjects are able to guess their last word if they are exposed to the whole text, but not if they only see the last sentence preceding the target word. To succeed on LAMBADA, computational models cannot simply rely on local context, but must be able to keep track of information in the broader discourse.
+
+根据logits向量来预测最后一个token，将logits输入到softmax函数中，即可得到每一个词的取值概率。有贪心算法和采样算法两种策略，贪心算法是指选择取值概率最大的词最为预测值，采样算法则根据概率进行采样。
+
+经过试验后发现，贪心算法所计算得到的准确率更高。
+
+### [StoryCloze](https://huggingface.co/datasets/LSDSem/story_cloze)
+
+GPT3 Zero-shot --> 63.3
+
+This test requires a system to choose the correct ending to a four-sentence story.
+
+Datasets Description
+```json
+{
+    "answer_right_ending": 1,
+    "input_sentence_1": "Rick grew up in a troubled household.",
+    "input_sentence_2": "He never found good support in family, and turned to gangs.",
+    "input_sentence_3": "It wasn't long before Rick got shot in a robbery.",
+    "input_sentence_4": "The incident caused him to turn a new leaf.",
+    "sentence_quiz1": "He is happy now.",
+    "sentence_quiz2": "He joined a gang.",
+    "story_id": "138d5bfb-05cc-41e3-bf2c-fa85ebad14e2"
+}
+```
+
+## 评估框架[EleutherAI](https://github.com/EleutherAI/lm-evaluation-harness)
+
+huggingface网络连接失败，无法下载数据集，也不知道如何使用本地的数据集进行评估。
 
 ## 日志记录
 
@@ -611,13 +691,15 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 
 ![lr=6e-4,T=1024,max_step=1epoch--eval](assets/lr=6e-4,T=1024,max_step=1epoch--eval.png)
 
-### `lr=6e-4, T=1024, max_step=4epoch`
+### `lr=6e-4, T=2048, max_step=1epoch`
 
+V100(16GB) 8卡并行，训练时长约为48小时。
+
+![lr=6e-4,T=2048,max_step=1epoch--loss](assets/lr=6e-4,T=2048,max_step=1epoch--loss.png)
+
+![lr=6e-4,T=2048,max_step=1epoch--eval](assets/lr=6e-4,T=2048,max_step=1epoch--eval.png)
 
 ### `lr=6e-4, T=2048, max_step=4epoch`
-
-
-### `lr=6e-4 * 4, T=2048, max_step=4epoch`
 
 
 
@@ -629,8 +711,9 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 
 **本地系统为 ubuntu ，下面的测试使用 git**
 
-1. 首先[检查本地现有的密钥](https://docs.github.com/zh/authentication/connecting-to-github-with-ssh/checking-for-existing-ssh-keys)，主要是查看现有密钥的名称/是否已经有连接 github 的密钥了。
-2. [生成新的 SSH 密钥并将其添加到 ssh-agent](https://docs.github.com/zh/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent)
+1. 在github创建一个空的项目，获得项目提交地址
+2. [检查本地现有的密钥](https://docs.github.com/zh/authentication/connecting-to-github-with-ssh/checking-for-existing-ssh-keys)，主要是查看现有密钥的名称/是否已经有连接 github 的密钥了。
+3. [生成新的 SSH 密钥并将其添加到 ssh-agent](https://docs.github.com/zh/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent)
 
 添加密钥到 ssh-agent 的时候出错了`Permissions 0664 for '/home/zhangyuanwang/.ssh/id_ed25519' are too open.`，这个错误提示是因为私钥文件权限设置得太宽松了。SSH 要求私钥文件的权限不能被其他人访问。
 
@@ -639,7 +722,44 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 3. [新增 SSH 密钥到 GitHub 帐户](https://docs.github.com/zh/authentication/connecting-to-github-with-ssh/adding-a-new-ssh-key-to-your-github-account)
 4. [使用 Git 将本地存储库添加到 GitHub](https://docs.github.com/zh/migrations/importing-source-code/using-the-command-line-to-import-source-code/adding-locally-hosted-code-to-github?platform=linux#%E4%BD%BF%E7%94%A8-git-%E5%B0%86%E6%9C%AC%E5%9C%B0%E5%AD%98%E5%82%A8%E5%BA%93%E6%B7%BB%E5%8A%A0%E5%88%B0-github)
 
+如果是第一次提交本地仓库到GitHub，需要先初始化本地仓库，然后再将本地仓库添加到GitHub上。
+
+```
+git init
+git add . # 暂存文件用于提交
+git commit -m "first commit" # 提交暂存在本地仓库中的文件
+git branch -M main
+git remote add origin git@github.com:zhangyuanwang777/build_nanoGPT.git
+git push -u origin main
+```
+
+由于我是克隆 karpathy 的项目，在此基础上进行的编辑，所以这个项目本身就有一个远程仓库，在进行`git remote add origin`时会报错，可以使用`git remote -v`查看远程 URL 设置是否正确。（其实也可以添加一个新的远程仓库，先前的origin仓库不会对其造成影响）
+
+我需要使用`git remote set-url origin git@github.com:zhangyuanwang777/build_nanoGPT.git`来更换远程仓库的地址，从而提交到我的 github 。
+
+如果只想针对该仓库提交，可以使用以下命令添加用户名和邮箱：
+
+```
+git config user.name "Your Name"
+git config user.email "you@example.com"
+```
+
+如果本地存储库有更改，可以使用如下命令将更改的内容推送到 github ：
+
+```
+git add .
+git commit -m "Your commit message"
+git push origin main
+```
+
 ## 权重上传huggingface
 
+## TODO
 
+https://github.com/karpathy/nanoGPT
+
+- 训练一个分词器
+- 微调
+- RLHF
+- 将大模型全流程走一遍
 

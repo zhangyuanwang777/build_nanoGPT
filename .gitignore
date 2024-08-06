@@ -1,11 +1,12 @@
 # 忽略目录
-checkpoints/
-logs/
-model/
-edu_fineweb10B/
-public_program/
-variables/
+checkpoints
+model
+edu_fineweb10B
+public_program
+variables
+lm-evaluation-harness
+gpt2_training_record
 
 # 忽略 Python 编译文件
 *.pyc
-__pycache__/
+__pycache__
